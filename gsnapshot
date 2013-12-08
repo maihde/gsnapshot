@@ -1,0 +1,171 @@
+#!/usr/bin/env python
+# :vim:et:sts=4:sw=4
+
+import sys
+import subprocess
+import os
+import tarfile
+import tempfile
+import time
+import commands
+from optparse import OptionParser
+import logging
+
+def gather_inodes(folder):
+    result = {}
+    for root, dirs, files in os.walk(folder):
+        for f in files:
+            fname = os.path.join(root, f)
+            if os.path.islink(fname): continue
+            inode = os.stat(fname).st_ino
+            result[inode] = fname
+    return result
+
+parser = OptionParser()
+parser.add_option("-c", "--config", default="/etc/rsnapshot.conf")
+parser.add_option("--snapshot-root", default=None)
+parser.add_option("--archive-root", default=None)
+parser.add_option("--vault", default="gsnapshot")
+parser.add_option("--keep-snapshot", default=False, action="store_true")
+parser.add_option("--dryrun", default=False, action="store_true")
+parser.add_option("--debug", default=False, action="store_true")
+parser.add_option("--sync", default=False, action="store_true")
+parser.add_option("--max-size", default=1000000000, type="int")
+parser.add_option("--upload-attempts", default=3, type="int")
+
+opts, args = parser.parse_args()
+
+logging.basicConfig()
+if opts.debug:
+    logging.getLogger().setLevel(logging.DEBUG)
+
+if opts.snapshot_root == None:
+    if not os.path.exists(opts.config):
+        parser.error("Could not load rsnapshot config from '%s'" % opts.config)
+    cfg = open(opts.config)
+    for l in cfg:
+        l = l.strip()
+        if l =="" or l.startswith("#"): continue
+        f = l.split(None, 2)
+        if f[0].strip() == "snapshot_root":
+            opts.snapshot_root = f[1].strip()
+            break
+logging.info("Using snapshot root '%s'", opts.snapshot_root)
+
+if len(args) < 1:
+    parser.error("Invalid arguments")
+
+name = args[0]
+try:
+    folder = args[1]
+    archive_prefix = name + "." + folder
+except IndexError:
+    folder = ""
+    archive_prefix = name
+
+dir0 = os.path.join(opts.snapshot_root, "%s.0" % name, folder)
+dir1 = os.path.join(opts.snapshot_root, "%s.1" % name, folder)
+if not os.path.exists(dir0):
+    logging.warning("Folder %s does not exist", dir0)
+    sys.exit(-1)
+
+
+dir0_mtime = os.stat(dir0).st_mtime
+dir0_mtime = time.strftime("%Y%m%d_%H%M%S", time.gmtime(dir0_mtime))
+if folder:
+    folder = folder.replace("/", ".")
+
+if not opts.archive_root:
+    opts.archive_root = opts.snapshot_root
+
+archivefile_basename = os.path.join(opts.archive_root, "%s.%s" % (archive_prefix, dir0_mtime))
+manifest_file = archivefile_basename + ".MANIFEST"
+if os.path.exists(manifest_file):
+    logging.info("Found existing manifest file, assuming glaicer upload has already occurred")
+    sys.exit(0)
+manifest_file = open(manifest_file, "w")
+
+# Gather inodes that have not yet been uploaded to glacier
+files0 = gather_inodes(dir0)
+if os.path.exists(dir1) and not opts.sync:
+    files1 = gather_inodes(dir1)
+else:
+    logging.info("Folder %s does not exist, assuming all files need to be archived", dir1)
+    files1 = {}
+
+set0 = set(files0.keys())
+set1 = set(files1.keys())
+
+# iNodes that exist in .0 but not in .1 (i.e. new files)
+new_files = [files0[x] for x in (set0 - set1)]
+new_files.sort(reverse=True)
+if new_files:
+    logging.info("Archiving %s files to glacier", len(new_files))
+    to_upload = []
+
+    
+    to_upload = []
+    to_upload.append(manifest_file.name)
+
+    archive_index = 1
+    tar = None
+
+    try:
+        logging.debug("Using archive basename '%s'", archivefile_basename)
+        while len(new_files) > 0:
+            fname = new_files.pop()
+            if tar == None:
+                archivefile = "%s.%03d.tbz2" % (archivefile_basename, archive_index)
+                manifest_file.write("# %s\n" % archivefile)
+                tar = tarfile.open(archivefile, mode="w:bz2")
+
+            logging.debug("Adding '%s' to archive '%s'", fname, archivefile)
+            tar.add(fname)
+            tsize = os.stat(archivefile).st_size
+
+            stat, output = commands.getstatusoutput("md5sum \"%s\"  " % fname)
+            if stat != 0:
+                logging.warning("Failed to calculate md5sum for file '%s' due to '%s'", fname, output)
+                output = "0 %s" % fname
+            manifest_file.write('%s\n' % output)
+
+            if tsize > opts.max_size:
+                logging.debug("Closing tarfile '%s'", archivefile)
+                tar.close()
+                to_upload.append(archivefile)
+                archive_index += 1
+                tar = None
+                archivefile = None
+    finally:
+        if manifest_file:
+            manifest_file.close()
+
+    try:
+        for archivefile in to_upload:
+            stat, output = commands.getstatusoutput("glacier archive check %s %s" % (opts.vault, archivefile))
+            if stat != 0:
+                logging.info("Uploading '%s' to glacier", archivefile)
+                if not opts.dryrun:
+                    attempts = opts.upload_attempts
+                    while attempts > 0:
+                        attempts -= 1
+                        logging.debug("Upload attempt for '%s'", archivefile)
+                        stat, output = commands.getstatusoutput("glacier archive upload %s %s" % (opts.vault, archivefile))
+                        if stat != 0 and attempts <= 0:
+                            logging.error("Failed to upload '%s' to glacier due to '%s'", archivefile, output)
+                            raise StandardError("Failed glacier upload")
+            else:
+                logging.info("Archive '%s' already exists" % archivefile)
+    except:
+        logging.exception("Failure to archive upload due to error")
+        # If there are any errors, don't delete the archives...hopefully
+        # the user has setup cron to email them so they can learn of the failure
+        sys.exit(-1)
+
+    for archivefile in to_upload:
+        if not opts.keep_snapshot:
+            logging.info("Removing %s" % archivefile)
+            try:
+                os.remove(archivefile)
+            except:
+                logging.exception("Failed to remove %s" % archivefile)
